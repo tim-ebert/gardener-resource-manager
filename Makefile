@@ -27,12 +27,16 @@ LD_FLAGS := "-w $(shell EFFECTIVE_VERSION=$(EFFECTIVE_VERSION) $(REPO_ROOT)/vend
 # Rules for local development scenarios #
 #########################################
 
+LOG_LEVEL := 2
+
 .PHONY: start
 start:
 	@GO111MODULE=on go run \
 	    -mod=vendor \
 		-ldflags $(LD_FLAGS) \
 		./cmd/gardener-resource-manager \
+	  --v=$(LOG_LEVEL) \
+	  --logging-format=json \
 	  --leader-election=false \
 	  --sync-period=60s \
 	  --max-concurrent-workers=10 \

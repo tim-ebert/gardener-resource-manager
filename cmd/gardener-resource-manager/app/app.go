@@ -16,12 +16,16 @@ package app
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/component-base/logs"
+	"k8s.io/klog/v2/klogr"
 	runtimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -30,16 +34,14 @@ import (
 	resourcecontroller "github.com/gardener/gardener-resource-manager/pkg/controller/managedresource"
 	secretcontroller "github.com/gardener/gardener-resource-manager/pkg/controller/secret"
 	"github.com/gardener/gardener-resource-manager/pkg/healthz"
-	logpkg "github.com/gardener/gardener-resource-manager/pkg/log"
 	"github.com/gardener/gardener-resource-manager/pkg/version"
 )
 
-var log = runtimelog.Log.WithName("gardener-resource-manager")
+var log = runtimelog.Log
 
 // NewResourceManagerCommand creates a new command for running a gardener resource manager controllers.
 func NewResourceManagerCommand() *cobra.Command {
-	runtimelog.SetLogger(logpkg.ZapLogger(false))
-	entryLog := log.WithName("entrypoint")
+	logOpts := logs.NewOptions()
 
 	managerOpts := &resourcemanagercmd.ManagerOptions{}
 	sourceClientOpts := &resourcemanagercmd.SourceClientOptions{}
@@ -53,14 +55,34 @@ func NewResourceManagerCommand() *cobra.Command {
 		Use:     "gardener-resource-manager",
 		Version: version.Get().GitVersion,
 
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if errs := logOpts.Validate(); len(errs) > 0 {
+				return utilerrors.NewAggregate(errs)
+			}
+			logOpts.Apply()
+			logger, err := logOpts.Get()
+			if err != nil {
+				return err
+			}
+			if logger == nil {
+				logger = klogr.New()
+			}
+
+			runtimelog.SetLogger(logger)
+
+			log.Info("Starting gardener-resource-manager...", "version", version.Get().GitVersion)
+			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+				log.Info(fmt.Sprintf("FLAG: --%s=%s", flag.Name, flag.Value))
+			})
+
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+			return nil
+		},
+
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-
-			entryLog.Info("Starting gardener-resource-manager...", "version", version.Get().GitVersion)
-			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
-				entryLog.Info(fmt.Sprintf("FLAG: --%s=%s", flag.Name, flag.Value))
-			})
 
 			if err := resourcemanagercmd.CompleteAll(
 				managerOpts,
@@ -83,7 +105,7 @@ func NewResourceManagerCommand() *cobra.Command {
 			targetClientOpts.Completed().Apply(&healthControllerOpts.Completed().TargetClientConfig)
 			resourceControllerOpts.Completed().ApplyClassFilter(&secretControllerOpts.Completed().ClassFilter)
 			resourceControllerOpts.Completed().ApplyClassFilter(&healthControllerOpts.Completed().ClassFilter)
-			err := resourceControllerOpts.Completed().ApplyDefaultClusterId(ctx, entryLog, sourceClientOpts.Completed().RESTConfig)
+			err := resourceControllerOpts.Completed().ApplyDefaultClusterId(ctx, log, sourceClientOpts.Completed().RESTConfig)
 			if err != nil {
 				return err
 			}
@@ -141,7 +163,7 @@ func NewResourceManagerCommand() *cobra.Command {
 				return err
 
 			case <-cmd.Context().Done():
-				entryLog.Info("Stop signal received, shutting down.")
+				log.Info("Stop signal received, shutting down.")
 				wg.Wait()
 				return nil
 			}
@@ -157,6 +179,10 @@ func NewResourceManagerCommand() *cobra.Command {
 		secretControllerOpts,
 		healthControllerOpts,
 	)
+
+	// add klog flags
+	logOpts.AddFlags(cmd.PersistentFlags())
+	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
 	return cmd
 }

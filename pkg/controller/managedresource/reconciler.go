@@ -24,16 +24,10 @@ import (
 	"sync"
 	"time"
 
-	resourcesv1alpha1 "github.com/gardener/gardener-resource-manager/api/resources/v1alpha1"
-	resourcesv1alpha1helper "github.com/gardener/gardener-resource-manager/api/resources/v1alpha1/helper"
-	"github.com/hashicorp/go-multierror"
-
-	"github.com/gardener/gardener-resource-manager/pkg/controller/utils"
-	"github.com/gardener/gardener-resource-manager/pkg/filter"
-
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	hvpav1alpha1 "github.com/gardener/hvpa-controller/api/v1alpha1"
 	"github.com/go-logr/logr"
+	"github.com/hashicorp/go-multierror"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -53,6 +47,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	resourcesv1alpha1 "github.com/gardener/gardener-resource-manager/api/resources/v1alpha1"
+	resourcesv1alpha1helper "github.com/gardener/gardener-resource-manager/api/resources/v1alpha1/helper"
+	"github.com/gardener/gardener-resource-manager/pkg/controller/utils"
+	"github.com/gardener/gardener-resource-manager/pkg/filter"
 )
 
 var (
@@ -90,7 +89,7 @@ func (r *Reconciler) InjectLogger(l logr.Logger) error {
 
 // Reconcile implements `reconcile.Reconciler`.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.log.WithValues("object", req)
+	log := r.log.WithValues("managedresource", req)
 
 	mr := &resourcesv1alpha1.ManagedResource{}
 	if err := r.client.Get(ctx, req.NamespacedName, mr); err != nil {
@@ -102,7 +101,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	action, responsible := r.class.Active(mr)
-	log.Info(fmt.Sprintf("reconcile: action required: %t, responsible: %t", action, responsible))
+	log.V(1).Info("reconcile request received", "action_required", action, "responsible", responsible)
 
 	// If the object should be deleted or the responsibility changed
 	// the actual deployments have to be deleted
@@ -137,7 +136,9 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 		forceOverwriteLabels      bool
 		forceOverwriteAnnotations bool
 
-		decodingErrors []*decodingError
+		decodingErrors = &multierror.Error{
+			ErrorFormat: utils.NewErrorFormatFuncWithPrefix("Could not decode all resources"),
+		}
 	)
 
 	if v := mr.Spec.ForceOverwriteLabels; v != nil {
@@ -176,14 +177,9 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 					break
 				}
 				if err != nil {
-					decodingError := &decodingError{
-						err:               err,
-						secret:            fmt.Sprintf("%s/%s", secret.Namespace, secret.Name),
-						secretKey:         key,
-						objectIndexInFile: i,
-					}
-					decodingErrors = append(decodingErrors, decodingError)
-					log.Error(decodingError.err, decodingError.StringShort())
+					msg := fmt.Sprintf("resource at index %d in key %q in secret %q", i, key, client.ObjectKeyFromObject(secret))
+					decodingErrors = multierror.Append(decodingErrors, fmt.Errorf("%s: %w", msg, err))
+					log.Error(err, "error decoding resource", "secret", client.ObjectKeyFromObject(secret), "secretKey", key, "indexInFile", i)
 					continue
 				}
 
@@ -198,8 +194,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 				if err != nil || mapping == nil {
 					// Cache miss most probably indicates, that the corresponding CRD is not yet applied.
 					// CRD might be applied later as part of the ManagedResource reconciliation
-					log.Info(fmt.Sprintf("could not get rest mapping for %s '%s/%s': %v", obj.GetKind(), obj.GetNamespace(), obj.GetName(), err),
-						"secret", fmt.Sprintf("%s/%s", secret.Namespace, secret.Name), "secretKey", key, "objectIndexInFile", i)
+					log.Info("could not get rest mapping for object", "resource", obj, "err", err, "secret", client.ObjectKeyFromObject(secret), "secretKey", key, "indexInFile", i)
 
 					// default namespace on a best effort basis
 					if obj.GetKind() != "Namespace" && obj.GetNamespace() == "" {
@@ -217,29 +212,27 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 					}
 				}
 
-				var (
-					newObj = object{
-						obj:                       obj,
-						forceOverwriteLabels:      forceOverwriteLabels,
-						forceOverwriteAnnotations: forceOverwriteAnnotations,
-					}
-					objectReference = resourcesv1alpha1.ObjectReference{
-						ObjectReference: corev1.ObjectReference{
-							APIVersion: newObj.obj.GetAPIVersion(),
-							Kind:       newObj.obj.GetKind(),
-							Name:       newObj.obj.GetName(),
-							Namespace:  newObj.obj.GetNamespace(),
-						},
-						Labels:      mergeMaps(newObj.obj.GetLabels(), mr.Spec.InjectLabels),
-						Annotations: newObj.obj.GetAnnotations(),
-					}
-				)
+				newObj := object{
+					obj:                       obj,
+					forceOverwriteLabels:      forceOverwriteLabels,
+					forceOverwriteAnnotations: forceOverwriteAnnotations,
+				}
+				newObj.ref = resourcesv1alpha1.ObjectReference{
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: newObj.obj.GetAPIVersion(),
+						Kind:       newObj.obj.GetKind(),
+						Name:       newObj.obj.GetName(),
+						Namespace:  newObj.obj.GetNamespace(),
+					},
+					Labels:      mergeMaps(newObj.obj.GetLabels(), mr.Spec.InjectLabels),
+					Annotations: newObj.obj.GetAnnotations(),
+				}
 
-				newObj.oldInformation, _ = existingResourcesIndex.Lookup(objectReference)
+				newObj.oldInformation, _ = existingResourcesIndex.Lookup(newObj.ref)
 				decodedObj = nil
 
 				newResourcesObjects = append(newResourcesObjects, newObj)
-				newResourcesObjectReferences = append(newResourcesObjectReferences, objectReference)
+				newResourcesObjectReferences = append(newResourcesObjectReferences, newObj.ref)
 			}
 		}
 	}
@@ -269,7 +262,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 		}
 	}
 
-	if deletionPending, err := r.cleanOldResources(reconcileCtx, existingResourcesIndex, mr); err != nil {
+	if deletionPending, err := r.cleanOldResources(reconcileCtx, log, existingResourcesIndex, mr); err != nil {
 		var (
 			reason string
 			status resourcesv1alpha1.ConditionStatus
@@ -296,7 +289,7 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 		}
 	}
 
-	if err := r.applyNewResources(reconcileCtx, origin, newResourcesObjects, mr.Spec.InjectLabels, equivalences); err != nil {
+	if err := r.applyNewResources(reconcileCtx, log, origin, newResourcesObjects, mr.Spec.InjectLabels, equivalences); err != nil {
 		conditionResourcesApplied = resourcesv1alpha1helper.UpdatedCondition(conditionResourcesApplied, resourcesv1alpha1.ConditionFalse, resourcesv1alpha1.ConditionApplyFailed, err.Error())
 		if err := tryUpdateManagedResourceConditions(ctx, r.client, mr, conditionResourcesApplied); err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not update the ManagedResource status: %+v", err)
@@ -305,8 +298,8 @@ func (r *Reconciler) reconcile(ctx context.Context, mr *resourcesv1alpha1.Manage
 		return ctrl.Result{}, fmt.Errorf("could not apply all new resources: %+v", err)
 	}
 
-	if len(decodingErrors) != 0 {
-		conditionResourcesApplied = resourcesv1alpha1helper.UpdatedCondition(conditionResourcesApplied, resourcesv1alpha1.ConditionFalse, resourcesv1alpha1.ConditionDecodingFailed, fmt.Sprintf("Could not decode all new resources: %v", decodingErrors))
+	if decodingErrors.Len() > 0 {
+		conditionResourcesApplied = resourcesv1alpha1helper.UpdatedCondition(conditionResourcesApplied, resourcesv1alpha1.ConditionFalse, resourcesv1alpha1.ConditionDecodingFailed, decodingErrors.Error())
 	} else {
 		conditionResourcesApplied = resourcesv1alpha1helper.UpdatedCondition(conditionResourcesApplied, resourcesv1alpha1.ConditionTrue, resourcesv1alpha1.ConditionApplySucceeded, "All resources are applied.")
 	}
@@ -341,7 +334,7 @@ func (r *Reconciler) delete(ctx context.Context, mr *resourcesv1alpha1.ManagedRe
 			return ctrl.Result{}, fmt.Errorf("could not update the ManagedResource status: %+v", err)
 		}
 
-		if deletionPending, err := r.cleanOldResources(deleteCtx, existingResourcesIndex, mr); err != nil {
+		if deletionPending, err := r.cleanOldResources(deleteCtx, log, existingResourcesIndex, mr); err != nil {
 			var (
 				reason string
 				status resourcesv1alpha1.ConditionStatus
@@ -368,7 +361,7 @@ func (r *Reconciler) delete(ctx context.Context, mr *resourcesv1alpha1.ManagedRe
 			}
 		}
 	} else {
-		log.Info(fmt.Sprintf("Do not delete any resources of %s because .spec.keepObjects=true", mr.Name))
+		log.Info("Not deleting any resources of because .spec.keepObjects=true")
 	}
 
 	log.Info("All resources have been deleted, removing finalizers from ManagedResource")
@@ -381,7 +374,7 @@ func (r *Reconciler) delete(ctx context.Context, mr *resourcesv1alpha1.ManagedRe
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) applyNewResources(ctx context.Context, origin string, newResourcesObjects []object, labelsToInject map[string]string, equivalences Equivalences) error {
+func (r *Reconciler) applyNewResources(ctx context.Context, logger logr.Logger, origin string, newResourcesObjects []object, labelsToInject map[string]string, equivalences Equivalences) error {
 	var (
 		results   = make(chan error)
 		wg        sync.WaitGroup
@@ -411,7 +404,8 @@ func (r *Reconciler) applyNewResources(ctx context.Context, origin string, newRe
 				scaledVertically   = isScaled(obj.obj, verticallyScaledObjects, equivalences)
 			)
 
-			r.log.Info("Applying", "resource", resource)
+			log := logger.WithValues("resource", utils.ObjectReferceLogWrapper{ObjectReference: obj.ref.ObjectReference})
+			log.V(1).Info("Applying resource")
 
 			results <- retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 				if operationResult, err := utils.TypedCreateOrUpdate(ctx, r.targetClient, r.targetScheme, current, r.alwaysUpdate, func() error {
@@ -435,7 +429,7 @@ func (r *Reconciler) applyNewResources(ctx context.Context, origin string, newRe
 					return merge(origin, obj.obj, current, obj.forceOverwriteLabels, obj.oldInformation.Labels, obj.forceOverwriteAnnotations, obj.oldInformation.Annotations, scaledHorizontally, scaledVertically)
 				}); err != nil {
 					if apierrors.IsConflict(err) {
-						r.log.Info(fmt.Sprintf("conflict during apply of object %q: %s", resource, err))
+						log.V(1).Info("conflict while applying resource", "err", err)
 						// return conflict error directly, so that the update will be retried
 						return err
 					}
@@ -586,7 +580,7 @@ func annotationExistsAndValueTrue(meta metav1.Object, key string) bool {
 	return annotationExists && valueTrue
 }
 
-func (r *Reconciler) cleanOldResources(ctx context.Context, index *ObjectIndex, mr *resourcesv1alpha1.ManagedResource) (bool, error) {
+func (r *Reconciler) cleanOldResources(ctx context.Context, logger logr.Logger, index *ObjectIndex, mr *resourcesv1alpha1.ManagedResource) (bool, error) {
 	type output struct {
 		obj             client.Object
 		deletionPending bool
@@ -615,13 +609,13 @@ func (r *Reconciler) cleanOldResources(ctx context.Context, index *ObjectIndex, 
 				obj.SetNamespace(ref.Namespace)
 				obj.SetName(ref.Name)
 
-				resource := unstructuredToString(obj)
-				r.log.Info("Deleting", "resource", resource)
+				log := logger.WithValues("resource", utils.ObjectReferceLogWrapper{ObjectReference: ref.ObjectReference})
+				log.V(1).Info("Deleting resource")
 
 				// get object before deleting to be able to do cleanup work for it
 				if err := r.targetClient.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, obj); err != nil {
 					if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
-						r.log.Error(err, "Error during deletion", "resource", resource)
+						log.Error(err, "Error during deletion")
 						results <- &output{obj, true, err}
 						return
 					}
@@ -632,13 +626,13 @@ func (r *Reconciler) cleanOldResources(ctx context.Context, index *ObjectIndex, 
 				}
 
 				if keepObject(obj) {
-					r.log.Info("Keeping object in the system as "+resourcesv1alpha1.KeepObject+" annotation found", "resource", unstructuredToString(obj))
+					log.Info("Keeping object in the system as " + resourcesv1alpha1.KeepObject + " annotation found")
 					results <- &output{obj, false, nil}
 					return
 				}
 
 				if err := cleanup(ctx, r.targetClient, r.targetScheme, obj, deletePVCs); err != nil {
-					r.log.Error(err, "Error during cleanup", "resource", resource)
+					log.Error(err, "Error during cleanup")
 					results <- &output{obj, true, err}
 					return
 				}
@@ -657,7 +651,7 @@ func (r *Reconciler) cleanOldResources(ctx context.Context, index *ObjectIndex, 
 
 				if err := r.targetClient.Delete(ctx, obj, deleteOptions); err != nil {
 					if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
-						r.log.Error(err, "Error during deletion", "resource", resource)
+						log.Error(err, "Error during deletion")
 						results <- &output{obj, true, err}
 						return
 					}
@@ -844,22 +838,8 @@ func mergeMaps(one, two map[string]string) map[string]string {
 
 type object struct {
 	obj                       *unstructured.Unstructured
+	ref                       resourcesv1alpha1.ObjectReference
 	oldInformation            resourcesv1alpha1.ObjectReference
 	forceOverwriteLabels      bool
 	forceOverwriteAnnotations bool
-}
-
-type decodingError struct {
-	err               error
-	secret            string
-	secretKey         string
-	objectIndexInFile int
-}
-
-func (d *decodingError) StringShort() string {
-	return fmt.Sprintf("Could not decode resource at index %d in '%s' in secret '%s'", d.objectIndexInFile, d.secretKey, d.secret)
-}
-
-func (d *decodingError) String() string {
-	return fmt.Sprintf("%s: %s.", d.StringShort(), d.err)
 }

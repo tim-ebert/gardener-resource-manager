@@ -15,18 +15,21 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"k8s.io/client-go/rest"
-
-	"github.com/gardener/gardener-resource-manager/cmd/gardener-resource-manager/app"
-	"github.com/gardener/gardener-resource-manager/pkg/log"
-
+	"k8s.io/component-base/logs"
 	runtimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+
+	"github.com/gardener/gardener-resource-manager/cmd/gardener-resource-manager/app"
 )
 
 func main() {
+	logs.InitLogs()
+	defer logs.FlushLogs()
+
 	rest.SetDefaultWarningHandler(
 		rest.NewWarningWriter(os.Stderr, rest.WarningWriterOptions{
 			// only print a given warning the first time we receive it
@@ -34,11 +37,13 @@ func main() {
 		}),
 	)
 
-	runtimelog.SetLogger(log.ZapLogger(false))
 	ctx := signals.SetupSignalHandler()
-
 	if err := app.NewResourceManagerCommand().ExecuteContext(ctx); err != nil {
-		runtimelog.Log.Error(err, "error executing the main controller command")
+		if log := runtimelog.Log; log.Enabled() {
+			log.Error(err, "error running gardener-resource-manager")
+		} else {
+			fmt.Printf("error running gardener-resource-manager: %v", err)
+		}
 		os.Exit(1)
 	}
 }
