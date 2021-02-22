@@ -27,7 +27,7 @@ LD_FLAGS := "-w $(shell EFFECTIVE_VERSION=$(EFFECTIVE_VERSION) $(REPO_ROOT)/vend
 # Rules for local development scenarios #
 #########################################
 
-LOG_LEVEL := 2
+LOG_LEVEL := debug
 
 .PHONY: start
 start:
@@ -35,8 +35,8 @@ start:
 	    -mod=vendor \
 		-ldflags $(LD_FLAGS) \
 		./cmd/gardener-resource-manager \
-	  --v=$(LOG_LEVEL) \
-	  --logging-format=json \
+	  --zap-log-level=$(LOG_LEVEL) \
+	  --zap-devel=true \
 	  --leader-election=false \
 	  --sync-period=60s \
 	  --max-concurrent-workers=10 \

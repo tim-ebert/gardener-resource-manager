@@ -23,10 +23,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/component-base/logs"
-	"k8s.io/klog/v2/klogr"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"k8s.io/klog/v2"
 	runtimelog "sigs.k8s.io/controller-runtime/pkg/log"
+	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	resourcemanagercmd "github.com/gardener/gardener-resource-manager/pkg/cmd"
@@ -41,7 +42,7 @@ var log = runtimelog.Log
 
 // NewResourceManagerCommand creates a new command for running a gardener resource manager controllers.
 func NewResourceManagerCommand() *cobra.Command {
-	logOpts := logs.NewOptions()
+	zapOpts := &logzap.Options{}
 
 	managerOpts := &resourcemanagercmd.ManagerOptions{}
 	sourceClientOpts := &resourcemanagercmd.SourceClientOptions{}
@@ -56,19 +57,24 @@ func NewResourceManagerCommand() *cobra.Command {
 		Version: version.Get().GitVersion,
 
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			if errs := logOpts.Validate(); len(errs) > 0 {
-				return utilerrors.NewAggregate(errs)
-			}
-			logOpts.Apply()
-			logger, err := logOpts.Get()
-			if err != nil {
-				return err
-			}
-			if logger == nil {
-				logger = klogr.New()
-			}
+			runtimelog.SetLogger(logzap.New(
+				// use configuration passed via flags
+				logzap.UseFlagOptions(zapOpts),
+				// and overwrite some stuff
+				func(o *logzap.Options) {
+					if !o.Development {
+						encCfg := zap.NewProductionEncoderConfig()
+						// overwrite time encoding to human readable format for production logs
+						encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+						o.Encoder = zapcore.NewJSONEncoder(encCfg)
+					}
 
-			runtimelog.SetLogger(logger)
+					// don't print stacktrace for warning level logs
+					o.StacktraceLevel = zapcore.ErrorLevel
+				},
+			))
+
+			klog.SetLogger(log)
 
 			log.Info("Starting gardener-resource-manager...", "version", version.Get().GitVersion)
 			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
@@ -180,9 +186,9 @@ func NewResourceManagerCommand() *cobra.Command {
 		healthControllerOpts,
 	)
 
-	// add klog flags
-	logOpts.AddFlags(cmd.PersistentFlags())
-	cmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
+	flagSet := flag.NewFlagSet("zap", flag.ExitOnError)
+	zapOpts.BindFlags(flagSet)
+	cmd.PersistentFlags().AddGoFlagSet(flagSet)
 
 	return cmd
 }

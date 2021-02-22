@@ -19,7 +19,6 @@ import (
 	"os"
 
 	"k8s.io/client-go/rest"
-	"k8s.io/component-base/logs"
 	runtimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 
@@ -27,9 +26,6 @@ import (
 )
 
 func main() {
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
 	rest.SetDefaultWarningHandler(
 		rest.NewWarningWriter(os.Stderr, rest.WarningWriterOptions{
 			// only print a given warning the first time we receive it
